@@ -27,6 +27,14 @@ The `NeuralMemoryRetriever` combines several components to provide a more sophis
 
 ## Installation
 
+This project is available on PyPI.
+
+```bash
+pip install langchain-nmret
+```
+
+## Development Installation
+
 1.  **Clone the repository:**
     ```bash
     git clone <your-repo-url>
@@ -213,4 +221,4 @@ See `pyproject.toml` and `uv.lock` for specific versions.
 
 ## License
 
-[Specify your license here, e.g., MIT License] - Currently uses the MIT License as per the `LICENSE` file.
+Uses the Apache 2.0 License as per the `LICENSE` file.
