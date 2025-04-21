@@ -199,6 +199,7 @@ for i, doc in enumerate(results):
 # # ... save state ...
 # # ... load state ...
 # titans_wrapper.load_state(loaded_state)
+```
 
 ## Important Notes - Limitations
 
