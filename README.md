@@ -24,6 +24,8 @@ The `NeuralMemoryRetriever` combines several components to provide a more sophis
 *   Configurable multi-step reasoning loop.
 *   Flexible memory update strategies (e.g., update neural memory per step or only at the end).
 *   Built on LangChain core interfaces (`BaseRetriever`, `BaseLanguageModel`, `Embeddings`, `VectorStore`).
+*   Includes metadata sanitization for compatibility with vector stores like ChromaDB.
+*   Robust handling of potential non-Document objects returned by vector stores.
 
 ## Installation
 
@@ -138,18 +140,15 @@ vectorstore.add_texts(
 
 
 # 3. Titans Neural Memory Wrapper
-# Configure NeuralMemory parameters as needed
-nm_kwargs = {
-    "mem_dim": 64, 
-    "layers": 1, 
-    "heads": 2, # embedding_dim (384) must be divisible by heads (2)
-    "chunk_size": 128,
-    "use_accelerated_scan": True, # Set to False if assoc-scan not installed
-}
 titans_wrapper = TitansNeuralMemoryWrapper(
-    embedding_dim=EMBEDDING_DIM, 
-    device=DEVICE, 
-    neural_memory_kwargs=nm_kwargs
+    embedding_dim=EMBEDDING_DIM,
+    device=DEVICE,
+    momentum=True, # Control momentum usage
+    # Pass other NeuralMemory args directly, e.g.:
+    layers=1,
+    heads=2, # Ensure embedding_dim (384) is divisible by heads (2)
+    chunk_size=128,
+    use_accelerated_scan=True # Set to False if assoc-scan not installed
 )
 
 # 4. Contextual Memory Wrapper
@@ -201,7 +200,10 @@ for i, doc in enumerate(results):
 # # ... load state ...
 # titans_wrapper.load_state(loaded_state)
 
-```
+## Important Notes - Limitations
+
+*   **Metadata Sanitization**: When adding documents via `VectorStoreContextualMemory`, metadata values are sanitized for compatibility with ChromaDB. It's recommended to use simple data types (string, integer, float, boolean) for metadata values. Lists and other complex types will be converted to string representations.
+*   **Titans NeuralMemory Arguments**: The `TitansNeuralMemoryWrapper` now accepts `NeuralMemory` arguments (like `layers`, `heads`, `chunk_size`, etc.) directly as keyword arguments (`**kwargs`) instead of through a separate dictionary.
 
 ## Dependencies
 
