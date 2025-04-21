@@ -70,7 +70,7 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.vectorstores import VectorStore
 
 # --- Assume necessary imports from the package ---
-from src.langchain_nmret.nmret import (
+from langchain_nmret import (
     NeuralMemoryRetriever,
     TitansNeuralMemoryWrapper,
     VectorStoreContextualMemory,
