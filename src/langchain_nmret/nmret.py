@@ -8,6 +8,8 @@ from typing import Any, cast
 import numpy as np
 import torch
 import torch.nn as nn
+
+# Import for metadata filtering
 from langchain_core.callbacks import (
     AsyncCallbackManager,
     AsyncCallbackManagerForLLMRun,
@@ -76,7 +78,7 @@ class TitansNeuralMemoryWrapper:
     """
 
     def __init__(
-        self, embedding_dim: int, device: str = "cpu", neural_memory_kwargs: dict | None = None
+        self, embedding_dim: int, device: str = "cpu", momentum: bool = True, **kwargs: dict[str, Any]
     ) -> None:
         """
         Initializes the wrapper and the underlying NeuralMemory model.
@@ -84,47 +86,19 @@ class TitansNeuralMemoryWrapper:
         Args:
             embedding_dim: The dimension of the embeddings used.
             device: The device ('cpu' or 'cuda') for PyTorch tensors.
-            neural_memory_kwargs: Dictionary of arguments to pass directly to the
-                                  NeuralMemory constructor (e.g., mem_dim, layers, heads,
-                                  chunk_size, use_accelerated_scan).
+            momentum: Whether the internal NeuralMemory should use momentum.
+            **kwargs: Additional keyword arguments passed directly to NeuralMemory.
         """
         self.device = torch.device(device)
         self.embedding_dim = embedding_dim
-        _default_nm_kwargs = {
-            "mem_dim": 128,
-            "layers": 2,
-            "heads": 4,
-            "chunk_size": 256,
-            "use_accelerated_scan": True,  # Default to True if library is installed
-        }
-        nm_kwargs = _default_nm_kwargs
-        if neural_memory_kwargs:
-            nm_kwargs.update(neural_memory_kwargs)
+        self.use_momentum = momentum
 
-        # Ensure dim is passed correctly and is divisible by heads if heads > 0
-        nm_kwargs["dim"] = embedding_dim
-        heads = nm_kwargs.get("heads", 1)
-        if heads > 0 and embedding_dim % heads != 0:
-            raise ValueError(
-                f"Embedding dimension ({embedding_dim}) must be divisible by heads ({heads}) for NeuralMemory"
-            )
-        if heads == 0:  # Handle case where heads might be 0 or invalid
-            nm_kwargs["heads"] = 1  # Default to 1 head if 0 provided
-            print("WARN: NeuralMemory heads set to 0, defaulting to 1.")
+        # Combine mandatory dim with other kwargs
+        nm_kwargs = {"dim": embedding_dim, "momentum": self.use_momentum, **kwargs}
 
         # Instantiate the actual NeuralMemory model
         try:
-            self.model = NeuralMemory(**nm_kwargs).to(self.device)  # type: ignore[arg-type]
-            # Check if assoc_scan is really available if requested
-            if nm_kwargs.get("use_accelerated_scan", False):
-                try:
-                    import importlib.util
-
-                    if importlib.util.find_spec("assoc_scan") is None:
-                        raise ImportError("assoc_scan module not found")
-                except ImportError:
-                    print("WARN: `use_accelerated_scan=True` but `assoc-scan` library not found. Disabling.")
-                    self.model.use_accelerated_scan = False  # Turn off if unavailable
+            self.model = NeuralMemory(**nm_kwargs).to(self.device)  # type: ignore
         except Exception as e:
             print(f"ERROR: Failed to instantiate NeuralMemory with kwargs {nm_kwargs}. Error: {e}")
             raise e
@@ -132,21 +106,18 @@ class TitansNeuralMemoryWrapper:
         # State is managed internally by passing NeuralMemState objects
         self.current_state: NeuralMemState | None = None
         print(f"TitansNeuralMemoryWrapper: Initialized using NeuralMemory on {self.device}")
-        print(f"  NeuralMemory Args: {nm_kwargs}")
+        print(f"  NeuralMemory Args used: {nm_kwargs}")
 
     def _ensure_state(self, batch_size: int) -> None:
         """Initializes state if it doesn't exist for the given batch size."""
         if self.current_state is None:
             print("TitansNeuralMemoryWrapper: Initializing internal NeuralMemState.")
-            # Use NeuralMemory's init methods (which require the instance)
-            # These methods need the *effective* batch size (batch * heads) if per_head=False? Check impl.
-            # Let's assume init_weights/momentum take the user-level batch size `b`.
-            with torch.no_grad():  # Initialization shouldn't track grads
-                # Need to handle potential TensorDict vs dict return from init methods
+            with torch.no_grad():
                 init_w_raw = self.model.init_weights(batch_size)
-                init_w = init_w_raw.detach()  # Detach the initial weights
+                init_w = init_w_raw.detach()
 
-                init_mom_raw = self.model.init_momentum(batch_size) if self.model.has_momentum else None
+                # Use the stored momentum flag
+                init_mom_raw = self.model.init_momentum(batch_size) if self.use_momentum else None
                 init_mom = init_mom_raw.detach() if init_mom_raw is not None else None
 
                 # Ensure initial state tensors are on the correct device
@@ -179,7 +150,8 @@ class TitansNeuralMemoryWrapper:
         print(f"TitansNeuralMemoryWrapper: Retrieving with input shape {query_tensor.shape}")
 
         # Call forward for retrieval only
-        retrieved_tensor, next_state, _ = self.model.forward(
+        # When return_surprises=False, forward likely returns only 2 values
+        retrieved_tensor, next_state = self.model.forward(
             seq=query_tensor,
             store_seq=None,
             state=self.current_state,
@@ -218,10 +190,15 @@ class TitansNeuralMemoryWrapper:
 
         print(f"TitansNeuralMemoryWrapper: Updating state with store_seq shape {store_seq_tensor.shape}")
 
-        # Call forward for storage only
+        # Call forward for storage only.
+        # Pass a dummy seq tensor to satisfy the forward method's signature
+        # and avoid the internal ndim error when seq is None.
+        batch_size = store_seq_tensor.shape[0]
+        dummy_seq_tensor = torch.empty((batch_size, 0, self.embedding_dim), device=self.device)
+
         # Crucially, pass the current state to continue the sequence
         _, next_state, surprises = self.model.forward(
-            seq=None,  # No retrieval sequence
+            seq=dummy_seq_tensor,  # Pass the dummy tensor
             store_seq=store_seq_tensor,
             state=self.current_state,  # Pass the managed state
             detach_mem_state=False,  # Allow state updates
@@ -283,30 +260,47 @@ class VectorStoreContextualMemory:
         if not texts:
             return
 
-        for meta in metadatas:
-            if "memory_id" not in meta:
+        # Use the metadatas directly, but sanitize them first for Chroma compatibility
+        sanitized_metadatas = [_sanitize_metadata_for_chroma(meta) for meta in metadatas]
+
+        # Ensure memory_id exists after sanitization
+        for meta in sanitized_metadatas:
+            if "memory_id" not in meta or not meta["memory_id"]:
                 meta["memory_id"] = str(uuid.uuid4())
 
         try:
-            ids = [m["memory_id"] for m in metadatas]
-            # Try add_embeddings first, fall back to add_texts if not available
+            # Use the sanitized metadata list
+            ids = [m["memory_id"] for m in sanitized_metadatas]
             if hasattr(self.vectorstore, "add_embeddings"):
                 self.vectorstore.add_embeddings(
-                    texts=texts, embeddings=embeddings, metadatas=metadatas, ids=ids
+                    texts=texts,
+                    embeddings=embeddings,
+                    metadatas=sanitized_metadatas,  # Use sanitized metadata
+                    ids=ids,
                 )
             else:
-                self.vectorstore.add_texts(texts=texts, metadatas=metadatas, ids=ids)
+                self.vectorstore.add_texts(
+                    texts=texts, metadatas=sanitized_metadatas, ids=ids
+                )  # Use sanitized metadata
             print(f"VectorStoreContextualMemory: Added {len(texts)} items using embeddings.")
-        except (NotImplementedError, AttributeError, TypeError):
+        except (NotImplementedError, AttributeError, TypeError) as e1:
             print(
-                "VectorStoreContextualMemory: add_embeddings failed/not found/"
-                "wrong args. Falling back to add_texts."
+                f"VectorStoreContextualMemory: add_embeddings failed/not found/"
+                f"wrong args ({e1}). Falling back to add_texts."
             )
             try:  # Try adding with IDs if add_texts supports it
-                ids = [m["memory_id"] for m in metadatas]
-                self.vectorstore.add_texts(texts=texts, metadatas=metadatas, ids=ids)
-            except TypeError:  # Fallback to adding without IDs
-                self.vectorstore.add_texts(texts=texts, metadatas=metadatas)
+                ids = [m["memory_id"] for m in sanitized_metadatas]
+                self.vectorstore.add_texts(
+                    texts=texts, metadatas=sanitized_metadatas, ids=ids
+                )  # Use sanitized metadata
+            except TypeError as e2:  # Fallback to adding without IDs
+                print(
+                    f"VectorStoreContextualMemory: add_texts with IDs failed ({e2}). "
+                    "Falling back without IDs."
+                )
+                self.vectorstore.add_texts(
+                    texts=texts, metadatas=sanitized_metadatas
+                )  # Use sanitized metadata
 
     def retrieve_associative(
         self, query_embedding: np.ndarray, top_k: int = 3
@@ -320,23 +314,67 @@ class VectorStoreContextualMemory:
             f"(top_k={top_k}) via vector similarity search."
         )
         try:
-            results_with_scores = self.vectorstore.similarity_search_with_relevance_scores(
-                query="",  # Some vector stores need a query string even for vector search
-                embedding=query_list,  # Pass vector directly
+            # --- Try similarity_search_by_vector first ---
+            docs = self.vectorstore.similarity_search_by_vector(
+                embedding=query_list,
                 k=top_k,
             )
-            # Note: relevance score might not be cosine/L2, adjust interpretation if needed
-            print(f"VectorStoreContextualMemory: Retrieved {len(results_with_scores)} items.")
+            # Assign dummy scores as this method doesn't usually return them
+            results_with_scores = [(doc, 0.0) for doc in docs]
+            print(
+                f"VectorStoreContextualMemory: Retrieved {len(results_with_scores)} "
+                "items via similarity_search_by_vector."
+            )
             return results_with_scores
-        except Exception as e:
-            print(f"ERROR: VectorStore similarity search failed: {e}")
-            # Fallback attempt without scores
+        except Exception as e1:
+            print(f"ERROR: similarity_search_by_vector failed: {e1}")
+            # --- Fallback to similarity_search_with_relevance_scores ---
+            print("VectorStoreContextualMemory: Falling back to similarity_search_with_relevance_scores.")
             try:
-                docs = self.vectorstore.similarity_search_by_vector(embedding=query_list, k=top_k)
-                return [(doc, 0.0) for doc in docs]  # Assign dummy score
+                results_with_scores = self.vectorstore.similarity_search_with_relevance_scores(
+                    query="",  # Still might need a dummy query string
+                    embedding=query_list,
+                    k=top_k,
+                )
+                print(
+                    f"VectorStoreContextualMemory: Retrieved {len(results_with_scores)} "
+                    "items via similarity_search_with_relevance_scores."
+                )
+                return results_with_scores
             except Exception as e2:
-                print(f"ERROR: Fallback similarity search failed: {e2}")
+                print(f"ERROR: Fallback similarity_search_with_relevance_scores also failed: {e2}")
+                # Check if the error is the specific one about the 'embedding' keyword
+                if "unexpected keyword argument 'embedding'" in str(e2):
+                    print(
+                        "  Hint: This might indicate an API mismatch between "
+                        "langchain-chroma and chromadb versions."
+                    )
                 return []
+
+
+# --- Helper function to sanitize metadata for Chroma ---
+def _sanitize_metadata_for_chroma(metadata: dict) -> dict:
+    sanitized_meta = {}
+
+    for key, value in metadata.items():
+        if isinstance(value, str | int | float | bool):
+            sanitized_meta[key] = value
+        elif isinstance(value, list):
+            # Convert list to a comma-separated string
+            try:
+                sanitized_meta[key] = ", ".join(map(str, value))
+            except Exception:
+                # Fallback if conversion fails
+                sanitized_meta[key] = "[List Conversion Failed]"
+        elif value is None:
+            sanitized_meta[key] = ""  # Replace None with empty string
+        else:
+            # For other complex types, convert to string representation
+            try:
+                sanitized_meta[key] = str(value)
+            except Exception:
+                sanitized_meta[key] = "[Complex Type Conversion Failed]"
+    return sanitized_meta
 
 
 # --- LightThinker ---
@@ -461,14 +499,47 @@ class NeuralMemoryRetriever(BaseRetriever):
         initial_doc_metadatas = []
         initial_doc_embeddings_list = []  # Need list of embeddings for contextual add
 
-        for doc in initial_docs:
+        # Process initial docs, converting dicts if necessary
+        new_initial_docs = []
+        for item in initial_docs:
+            doc = None
+            if isinstance(item, Document):
+                doc = item
+            elif isinstance(item, dict):  # type: ignore[unreachable]
+                print(
+                    f"WARN: Initial vector store retrieval returned dict: "
+                    f"{str(item)[:100]}... Attempting conversion."
+                )
+                try:
+                    page_content = item.get("page_content", "")
+                    metadata = item.get("metadata", {})
+                    doc = Document(page_content=page_content, metadata=metadata)
+                except Exception as conversion_e:
+                    print(f"WARN: Failed to convert dict to Document: {conversion_e}")
+                    continue  # Skip if conversion fails
+            else:
+                print(f"WARN: Initial vector store retrieval returned non-Document/dict item: {type(item)}")
+                continue  # Skip other types
+
+            if doc is None:
+                # Should not happen if logic above is correct
+                continue  # type: ignore[unreachable]
+
+            # Ensure metadata is a mutable dict if converted from dict
+            # ideally shouldn't happen but a fallback nonetheless
+            if not isinstance(doc.metadata, dict):
+                doc.metadata = {}  # type: ignore[unreachable]
+
             doc_id = doc.metadata.get("memory_id", str(uuid.uuid4()))
             doc.metadata["memory_id"] = doc_id
             if doc_id not in all_context_docs:
                 all_context_docs[doc_id] = doc
-                current_step_docs.append(doc)
-                initial_doc_texts.append(doc.page_content)
-                initial_doc_metadatas.append(doc.metadata)
+                new_initial_docs.append(doc)  # Add the processed Document
+                # Ensure attributes exist before appending
+                initial_doc_texts.append(getattr(doc, "page_content", ""))
+                initial_doc_metadatas.append(getattr(doc, "metadata", {}))
+        current_step_docs = new_initial_docs  # Update current_step_docs with only valid Documents
+
         if initial_doc_texts:
             # Get embeddings *once*
             initial_doc_embeddings_np = self._get_embeddings(initial_doc_texts)
@@ -480,7 +551,7 @@ class NeuralMemoryRetriever(BaseRetriever):
             self.contextual_memory.add(initial_doc_texts, initial_doc_embeddings_list, initial_doc_metadatas)
 
         reasoning_trace.append(f"Initial retrieval added {len(current_step_docs)} new unique documents.")
-        print(f"  Found {len(initial_docs)} docs, added {len(current_step_docs)} unique.")
+        print(f"  Found {len(initial_docs)} docs, processed {len(current_step_docs)} unique Documents.")
 
         query_embedding = self._get_embedding(query)
 
@@ -494,9 +565,40 @@ class NeuralMemoryRetriever(BaseRetriever):
             step_context_docs = current_step_docs
 
             # --- Prepare Input ---
-            step_input_prompt, current_embeddings_for_memory = self._prepare_step_input(
-                query, reasoning_trace, step_context_docs, self.compressor.get_compressed_representation()
-            )
+            # Add try-except block to catch AttributeError and log the problematic item
+            try:
+                step_input_prompt, current_embeddings_for_memory = self._prepare_step_input(
+                    query, reasoning_trace, step_context_docs, self.compressor.get_compressed_representation()
+                )
+            except AttributeError as ae:
+                problematic_item = None
+                for item in step_context_docs:
+                    # Check if it's not a Document and lacks expected attributes
+                    if not isinstance(item, Document):
+                        try:  # type: ignore[unreachable]
+                            _ = item.metadata  # Try accessing the attribute likely causing the error
+                            # ideally shouldn't happen but a fallback nonetheless
+                        except AttributeError:
+                            problematic_item = item
+                            break
+                        try:
+                            _ = item.page_content  # Also check page_content access
+                        except AttributeError:
+                            problematic_item = item
+                            break
+
+                print("ERROR: Caught AttributeError in _get_relevant_documents loop.")
+                print(f"  Step: {step + 1}")
+                if problematic_item is not None:
+                    print(f"  Identified Problematic Item Type: {type(problematic_item)}")  # type: ignore[unreachable]
+                    print(f"  Problematic Item Content (first 500 chars): {str(problematic_item)[:500]}")
+                else:
+                    print(
+                        "  Could not isolate the specific problematic item, but an AttributeError occurred."
+                    )
+                print(f"  Full step_context_docs types at error: {[type(d) for d in step_context_docs]}")
+                raise ae  # Re-raise the error after logging details
+
             # Calculate mean embedding for input
             step_input_embedding = (
                 np.mean(current_embeddings_for_memory, axis=0).reshape(1, -1)
@@ -514,12 +616,43 @@ class NeuralMemoryRetriever(BaseRetriever):
             run_manager.on_text(f"Contextual memory retrieved {len(contextual_results)} items.")
             step_input_prompt += "\n\nContextual Memory Hints:\n"
             retrieved_context_docs = []
-            for doc, score in contextual_results:
+            for item, score in contextual_results:
+                doc = None
+                if isinstance(item, Document):
+                    doc = item
+                elif isinstance(item, dict):  # type: ignore[unreachable]
+                    print(
+                        f"WARN: Contextual memory retrieved dict: {str(item)[:100]}... Attempting conversion."
+                    )
+                    try:
+                        page_content = item.get("page_content", "")
+                        metadata = item.get("metadata", {})
+                        doc = Document(page_content=page_content, metadata=metadata)
+                    except Exception as conversion_e:
+                        print(f"WARN: Failed to convert dict to Document: {conversion_e}")
+                        continue
+                else:
+                    print(f"WARN: Contextual memory retrieved non-Document/dict item: {type(item)}")
+                    continue
+
+                # Should not happen if logic above is correct
+                if doc is None:
+                    continue  # type: ignore[unreachable]
+
+                # Ensure metadata is a mutable dict if converted from dict
+                # ideally shouldn't happen but a fallback nonetheless
+                if not isinstance(doc.metadata, dict):
+                    doc.metadata = {}  # type: ignore[unreachable]
+
                 doc_id = doc.metadata.get("memory_id", "unknown_id")
-                step_input_prompt += f"- (Score: {score:.3f}) ID: {doc_id}: {doc.page_content[:100]}...\n"
+                # Ensure metadata exists and add score before adding to prompt
+                doc.metadata["retrieval_score"] = score  # Optionally add score to metadata
+
+                content_preview = getattr(doc, "page_content", "")[:100]
+                step_input_prompt += f"- (Score: {score:.3f}) ID: {doc_id}: {content_preview}...\n"
                 if doc_id not in all_context_docs:
                     all_context_docs[doc_id] = doc
-                    retrieved_context_docs.append(doc)
+                    retrieved_context_docs.append(doc)  # Add the processed Document
             if retrieved_context_docs:
                 print(f"  Added {len(retrieved_context_docs)} unique docs from contextual retrieval.")
                 step_context_docs.extend(retrieved_context_docs)
@@ -624,11 +757,28 @@ class NeuralMemoryRetriever(BaseRetriever):
         # 4. Final Document Selection
         print("\n--- Finalizing Retrieval ---")
         final_documents = current_step_docs
-        print(f"Returning {len(final_documents)} documents from the final step's context.")
 
-        # Log retriever end
-        run_manager.on_retriever_end(final_documents)
-        return final_documents
+        # === DEBUGGING: Check types before returning ===
+        print("--- DEBUG: Pre-filtering final_documents ---")
+        print(f"Type: {type(final_documents)}, Length: {len(final_documents)}")
+        for idx, item in enumerate(final_documents):
+            print(f"Item {idx} type: {type(item)}")
+        print("--- DEBUG: End pre-filtering ---")
+        # === END DEBUGGING ===
+
+        # Explicitly filter the final_documents list to ensure only Document instances are included
+        final_document_objects = [doc for doc in final_documents if isinstance(doc, Document)]
+
+        if len(final_document_objects) != len(final_documents):
+            filtered_count = len(final_documents) - len(final_document_objects)
+            print(f"WARN: Filtered out {filtered_count} non-Document items before returning.")
+
+        print(f"Returning {len(final_document_objects)} actual Document objects from the retriever.")
+
+        # Log retriever end with the filtered list
+        run_manager.on_retriever_end(final_document_objects)
+
+        return final_document_objects  # Return the filtered list
 
     # --- Helper Methods ---
     def _prepare_step_input(
@@ -646,12 +796,17 @@ class NeuralMemoryRetriever(BaseRetriever):
             prompt += "\n\nCompressed Context State Available."
 
         prompt += "\n\nCurrent Context Documents:\n"
-        doc_embeddings = self._get_embeddings([d.page_content for d in context_docs])
 
-        if context_docs:
-            for i, doc in enumerate(context_docs):
-                doc_id = doc.metadata.get("memory_id", "N/A")
-                content_preview = doc.page_content[:150]
+        # Filter context_docs to ensure they are Documents and get embeddings safely
+        valid_context_docs = [doc for doc in context_docs if isinstance(doc, Document)]
+        doc_embeddings = self._get_embeddings([getattr(d, "page_content", "") for d in valid_context_docs])
+
+        if valid_context_docs:
+            for i, doc in enumerate(valid_context_docs):
+                # Safely access metadata and page_content
+                doc_meta = getattr(doc, "metadata", {})
+                doc_id = doc_meta.get("memory_id", "N/A")
+                content_preview = getattr(doc, "page_content", "")[:150]
                 prompt += f"- Doc {i + 1} (ID: {doc_id}): {content_preview}...\n"
         else:
             prompt += "- None\n"
@@ -669,9 +824,10 @@ class NeuralMemoryRetriever(BaseRetriever):
         """Prepares the single sequence input required by NeuralMemory.forward for storage."""
         print(f"  _prepare_source_sequence_for_update (Mode: {mode})")
         source_texts = []
+        valid_docs = [doc for doc in docs if isinstance(doc, Document)]  # Filter upfront
 
-        if mode in ["docs_only", "docs_and_llm"] and docs:
-            source_texts.extend([d.page_content for d in docs])
+        if mode in ["docs_only", "docs_and_llm"] and valid_docs:
+            source_texts.extend([getattr(d, "page_content", "") for d in valid_docs])
 
         if mode in ["llm_only", "docs_and_llm"] and llm_output:
             source_texts.append(llm_output)
@@ -695,14 +851,22 @@ class NeuralMemoryRetriever(BaseRetriever):
         print(f"  _prepare_data_for_contextual_memory_add (Mode: {mode})")
         texts_ctx = []
         metas_ctx = []
+        valid_docs = [doc for doc in docs if isinstance(doc, Document)]  # Filter upfront
 
-        if mode in ["docs_only", "docs_and_llm"] and docs:
-            texts_ctx.extend([d.page_content for d in docs])
+        if mode in ["docs_only", "docs_and_llm"] and valid_docs:
+            texts_ctx.extend([getattr(d, "page_content", "") for d in valid_docs])
             # Crucially, ensure metadata includes the 'memory_id' used by the vector store
-            metas_ctx.extend([d.metadata.copy() for d in docs])  # Use copy
-            for m in metas_ctx[-len(docs) :]:  # Ensure added docs have ID
-                if "memory_id" not in m:
-                    m["memory_id"] = str(uuid.uuid4())
+            # Use getattr for metadata access and ensure it's a dict
+            current_metas = []
+            for d in valid_docs:
+                meta = getattr(d, "metadata", {})
+                if not isinstance(meta, dict):  # Ensure it's a dict
+                    meta = {}
+                meta_copy = meta.copy()
+                if "memory_id" not in meta_copy:
+                    meta_copy["memory_id"] = str(uuid.uuid4())
+                current_metas.append(meta_copy)
+            metas_ctx.extend(current_metas)
 
         if mode in ["llm_only", "docs_and_llm"] and llm_output:
             texts_ctx.append(llm_output)
@@ -761,16 +925,13 @@ if __name__ == "__main__":
     # 3. Titans Wrapper with NeuralMemory kwargs
     # Ensure these match expectations of the imported NeuralMemory
     nm_kwargs_example = {
-        "mem_dim": 64,  # Internal dimension of the memory MLP/Attn
         "layers": 1,  # Depth of the memory MLP/Attn model
         "heads": 2,  # Number of heads for internal projections/norms
         "chunk_size": 256,  # Chunk size for processing updates
         "momentum": True,  # Enable momentum
         "qk_rmsnorm": False,  # Example: Disable QK norm
     }
-    titans_wrapper = TitansNeuralMemoryWrapper(
-        embedding_dim=EMBEDDING_DIM, device=DEVICE, neural_memory_kwargs=nm_kwargs_example
-    )
+    titans_wrapper = TitansNeuralMemoryWrapper(embedding_dim=EMBEDDING_DIM, device=DEVICE)
 
     # 4. Contextual Memory Wrapper
     contextual_memory = VectorStoreContextualMemory(vectorstore=vectorstore, embedding_model=embedding_model)
